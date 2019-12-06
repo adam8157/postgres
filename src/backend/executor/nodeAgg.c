@@ -1291,6 +1291,68 @@ project_aggregates(AggState *aggstate)
 	return NULL;
 }
 
+static bool
+find_aggregated_cols_walker(Node *node, Bitmapset **colnos)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+
+		*colnos = bms_add_member(*colnos, var->varattno);
+
+		return false;
+	}
+	return expression_tree_walker(node, find_aggregated_cols_walker,
+								  (void *) colnos);
+}
+
+/*
+ * find_aggregated_cols
+ *	  Construct a bitmapset of the column numbers of aggregated Vars
+ *	  appearing in our targetlist and qual (HAVING clause)
+ */
+static Bitmapset *
+find_aggregated_cols(AggState *aggstate)
+{
+	Agg		   *node = (Agg *) aggstate->ss.ps.plan;
+	Bitmapset  *colnos = NULL;
+	ListCell   *temp;
+
+	/*
+	 * We only want the columns used by aggregations in the targetlist or qual
+	 */
+	if (node->plan.targetlist != NULL)
+	{
+		foreach(temp, (List *) node->plan.targetlist)
+		{
+			if (IsA(lfirst(temp), TargetEntry))
+			{
+				Node *node = (Node *)((TargetEntry *)lfirst(temp))->expr;
+				if (IsA(node, Aggref) || IsA(node, GroupingFunc))
+					find_aggregated_cols_walker(node, &colnos);
+			}
+		}
+	}
+
+	if (node->plan.qual != NULL)
+	{
+		foreach(temp, (List *) node->plan.qual)
+		{
+			if (IsA(lfirst(temp), TargetEntry))
+			{
+				Node *node = (Node *)((TargetEntry *)lfirst(temp))->expr;
+				if (IsA(node, Aggref) || IsA(node, GroupingFunc))
+					find_aggregated_cols_walker(node, &colnos);
+			}
+		}
+	}
+
+	return colnos;
+}
+
 /*
  * find_unaggregated_cols
  *	  Construct a bitmapset of the column numbers of un-aggregated Vars
@@ -1519,6 +1581,23 @@ find_hash_columns(AggState *aggstate)
 		/* Add all the grouping columns to colnos */
 		for (i = 0; i < perhash->numCols; i++)
 			colnos = bms_add_member(colnos, grpColIdx[i]);
+
+		/*
+		 * Find the columns used by aggregations
+		 *
+		 * This is shared by the entire aggregation.
+		 */
+		if (aggstate->aggregated_columns == NULL)
+			aggstate->aggregated_columns = find_aggregated_cols(aggstate);
+
+		/*
+		 * The necessary columns to spill are either group keys or used by
+		 * aggregations
+		 *
+		 * This is the convenient place to calculate the necessary columns to
+		 * spill, because the group keys are different per hash.
+		 */
+		perhash->necessarySpillCols = bms_union(colnos, aggstate->aggregated_columns);
 
 		/*
 		 * First build mapping for columns directly hashed. These are the
@@ -1860,6 +1939,23 @@ lookup_hash_entries(AggState *aggstate)
 			if (spill->partitions == NULL)
 				hash_spill_init(spill, 0, perhash->aggnode->numGroups,
 								aggstate->hashentrysize);
+
+			AggStatePerHash perhash = &aggstate->perhash[aggstate->current_set];
+			for (int ttsno = 0; ttsno < slot->tts_nvalid; ttsno++)
+			{
+				/*
+				 * null the column out if it's unnecessary, the following
+				 * forming functions will shrink it.
+				 *
+				 * it must be a virtual tuple here, this function is only used
+				 * by the first round, tuples are from other node but not the
+				 * spilled files.
+				 *
+				 * note: ttsno is zero indexed, cols are one indexed.
+				 */
+				if (!bms_is_member(ttsno+1, perhash->necessarySpillCols))
+					slot->tts_isnull[ttsno] = true;
+			}
 
 			aggstate->hash_disk_used += hash_spill_tuple(spill, 0, slot, hash);
 		}
@@ -2623,7 +2719,15 @@ hash_spill_tuple(HashAggSpill *spill, int input_bits, TupleTableSlot *slot,
 
 	Assert(spill->partitions != NULL);
 
-	/*TODO: project needed attributes only */
+	/*
+	 * heap_form_minimal_tuple() if it's a virtual tuple,
+	 * tts_minimal_get_minimal_tuple() if it's a minimal tuple, which is
+	 * exactly what we want.
+	 *
+	 * when we spill the tuples from input, they are virtual tuples with some
+	 * columns nulled out, when we re-spill the tuples from spilling files,
+	 * they are minimal tuples which was already nulled out before.
+	 */
 	tuple = ExecFetchSlotMinimalTuple(slot, &shouldFree);
 
 	if (spill->partition_bits == 0)
@@ -3072,6 +3176,7 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 	 */
 	aggstate->phases = palloc0(numPhases * sizeof(AggStatePerPhaseData));
 
+	aggstate->aggregated_columns = NULL;
 	aggstate->num_hashes = numHashes;
 	if (numHashes)
 	{

@@ -2084,6 +2084,7 @@ typedef struct AggState
 	uint64		hash_disk_used; /* bytes of disk space used */
 	int			hash_batches_used;	/* batches used during entire execution */
 	List	   *hash_batches;	/* hash batches remaining to be processed */
+	Bitmapset  *aggregated_columns; /* the columns used by aggregations */
 
 	AggStatePerHash perhash;	/* array of per-hashtable data */
 	AggStatePerGroup *hash_pergroup;	/* grouping set indexed array of

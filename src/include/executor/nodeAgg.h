@@ -302,6 +302,7 @@ typedef struct AggStatePerHashData
 	AttrNumber *hashGrpColIdxInput; /* hash col indices in input slot */
 	AttrNumber *hashGrpColIdxHash;	/* indices in hash table tuples */
 	Agg		   *aggnode;		/* original Agg node, for numGroups etc. */
+	Bitmapset  *necessarySpillCols;  /* the necessary columns if spills */
 }			AggStatePerHashData;
 
 
