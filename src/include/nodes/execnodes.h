@@ -2066,13 +2066,30 @@ typedef struct AggState
 	HeapTuple	grp_firstTuple; /* copy of first tuple of current group */
 	/* these fields are used in AGG_HASHED and AGG_MIXED modes: */
 	bool		table_filled;	/* hash table filled yet? */
-	int			num_hashes;
+	int			num_hashes;		/* number of hash tables active at once */
+	bool		hash_spilled;	/* any hash table ever spilled? */
+	double		hashentrysize;	/* estimate revised during execution */
+	struct HashAggSpill *hash_spills; /* HashAggSpill for each hash table,
+										 exists only during first pass if spilled */
+	TupleTableSlot *hash_spill_slot; /* slot for reading from spill files */
+	bool		hash_no_new_groups;	/* we hit a limit during the current batch
+									   and we must not create new groups */
+	Size		hash_mem_current; /* current hash table memory usage */
+	Size		hash_mem_limit;	/* limit before spilling hash table */
+	Size		hash_mem_peak;	/* peak hash table memory usage */
+	long		hash_ngroups_current;	/* number of groups currently in
+										   memory in all hash tables */
+	long		hash_ngroups_limit;	/* limit before spilling hash table */
+	uint64		hash_disk_used; /* bytes of disk space used */
+	int			hash_batches_used;	/* batches used during entire execution */
+	List	   *hash_batches;	/* hash batches remaining to be processed */
+
 	AggStatePerHash perhash;	/* array of per-hashtable data */
 	AggStatePerGroup *hash_pergroup;	/* grouping set indexed array of
 										 * per-group pointers */
 
 	/* support for evaluation of agg input expressions: */
-#define FIELDNO_AGGSTATE_ALL_PERGROUPS 34
+#define FIELDNO_AGGSTATE_ALL_PERGROUPS 47
 	AggStatePerGroup *all_pergroups;	/* array of first ->pergroups, than
 										 * ->hash_pergroup */
 	ProjectionInfo *combinedproj;	/* projection machinery */
