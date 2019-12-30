@@ -247,6 +247,7 @@
 #include "utils/datum.h"
 #include "utils/dynahash.h"
 #include "utils/expandeddatum.h"
+#include "utils/logtape.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
@@ -288,8 +289,9 @@ typedef struct HashAggSpill
 	int       n_partitions;		/* number of output partitions */
 	int       partition_bits;	/* number of bits for partition mask
 								   log2(n_partitions) parent partition bits */
-	BufFile **partitions;		/* output partition files */
+	int      *partitions;		/* output logtape numbers */
 	int64    *ntuples;			/* number of tuples in each partition */
+	LogicalTapeSet *lts;
 } HashAggSpill;
 
 /*
@@ -298,11 +300,12 @@ typedef struct HashAggSpill
  */
 typedef struct HashAggBatch
 {
-	BufFile *input_file;		/* input partition */
+	int      input_tape;		/* input partition */
 	int      input_bits;		/* number of bits for input partition mask */
 	int64    input_tuples;		/* number of tuples in this batch */
 	int		 setno;				/* grouping set */
 	HashAggSpill spill;			/* spill output */
+	LogicalTapeSet *lts;
 } HashAggBatch;
 
 static void select_current_set(AggState *aggstate, int setno, bool is_hash);
@@ -359,9 +362,8 @@ static void hash_spill_init(HashAggSpill *spill, int input_bits,
 							uint64 input_tuples, double hashentrysize);
 static Size hash_spill_tuple(HashAggSpill *spill, int input_bits,
 							 TupleTableSlot *slot, uint32 hash);
-static MinimalTuple hash_read_spilled(BufFile *file, uint32 *hashp);
-static HashAggBatch *hash_batch_new(BufFile *input_file, int setno,
-									int64 input_tuples, int input_bits);
+static MinimalTuple hash_read_spilled(LogicalTapeSet *lts, int tapenum, uint32 *hashp);
+static HashAggBatch *hash_batch_new(LogicalTapeSet *lts, int tapenum, int setno, int64 input_tuples, int input_bits);
 static void hash_finish_initial_spills(AggState *aggstate);
 static void hash_spill_finish(AggState *aggstate, HashAggSpill *spill,
 							  int setno, int input_bits);
@@ -2462,7 +2464,7 @@ agg_refill_hash_table(AggState *aggstate)
 
 		CHECK_FOR_INTERRUPTS();
 
-		tuple = hash_read_spilled(batch->input_file, &hash);
+		tuple = hash_read_spilled(batch->lts, batch->input_tape, &hash);
 		if (tuple == NULL)
 			break;
 
@@ -2503,8 +2505,6 @@ agg_refill_hash_table(AggState *aggstate)
 		 */
 		ResetExprContext(aggstate->tmpcontext);
 	}
-
-	BufFileClose(batch->input_file);
 
 	aggstate->current_phase = 0;
 	aggstate->phase = &aggstate->phases[aggstate->current_phase];
@@ -2690,6 +2690,8 @@ hash_spill_init(HashAggSpill *spill, int input_bits, uint64 input_groups,
 {
 	int     npartitions;
 	int     partition_bits;
+	int     i;
+	int     old_npartitions;
 
 	npartitions = hash_choose_num_spill_partitions(input_groups,
 												   hashentrysize);
@@ -2702,10 +2704,36 @@ hash_spill_init(HashAggSpill *spill, int input_bits, uint64 input_groups,
 	/* number of partitions will be a power of two */
 	npartitions = 1L << partition_bits;
 
-	spill->partition_bits = partition_bits;
-	spill->n_partitions = npartitions;
-	spill->partitions = palloc0(sizeof(BufFile *) * npartitions);
-	spill->ntuples = palloc0(sizeof(int64) * npartitions);
+	if (spill->lts == NULL)
+	{
+		spill->partition_bits = partition_bits;
+		spill->n_partitions   = npartitions;
+		spill->partitions     = palloc0(sizeof(int) * npartitions);
+			for (i = 0; i < spill->n_partitions; ++i)
+		{
+			spill->partitions[i] = i;
+		}
+		spill->ntuples        = palloc0(sizeof(int64) * spill->n_partitions);
+		spill->lts            = LogicalTapeSetCreate(npartitions,
+		                                             NULL,
+		                                             NULL,
+		                                             0); // TODO: worker is 0?
+	}
+	else // respill
+	{
+		old_npartitions = spill->n_partitions;
+		spill->partition_bits = my_log2(spill->n_partitions + npartitions);
+		spill->n_partitions   = 1L << spill->partition_bits;
+		spill->partitions     = palloc0(sizeof(int) * npartitions);
+		for (i = old_npartitions; i < spill->n_partitions; ++i)
+		{
+			spill->partitions[i] = i;
+		}
+		spill->ntuples        = palloc0(sizeof(int64) * spill->n_partitions);
+		spill->lts            = LogicalTapeSetExtend(spill->lts,
+		                                             spill->n_partitions -
+			                                             old_npartitions);
+	}
 }
 
 /*
@@ -2720,8 +2748,6 @@ hash_spill_tuple(HashAggSpill *spill, int input_bits, TupleTableSlot *slot,
 {
 	int					 partition;
 	MinimalTuple		 tuple;
-	BufFile				*file;
-	int					 written;
 	int					 total_written = 0;
 	bool				 shouldFree;
 
@@ -2743,23 +2769,11 @@ hash_spill_tuple(HashAggSpill *spill, int input_bits, TupleTableSlot *slot,
 
 	spill->ntuples[partition]++;
 
-	if (spill->partitions[partition] == NULL)
-		spill->partitions[partition] = BufFileCreateTemp(false);
-	file = spill->partitions[partition];
+	LogicalTapeWrite(spill->lts, spill->partitions[partition], (void *) &hash, sizeof(uint32));
+	total_written += sizeof(uint32);
 
-	written = BufFileWrite(file, (void *) &hash, sizeof(uint32));
-	if (written != sizeof(uint32))
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not write to HashAgg temporary file: %m")));
-	total_written += written;
-
-	written = BufFileWrite(file, (void *) tuple, tuple->t_len);
-	if (written != tuple->t_len)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not write to HashAgg temporary file: %m")));
-	total_written += written;
+	LogicalTapeWrite(spill->lts, spill->partitions[partition], (void *) tuple, tuple->t_len);
+	total_written += tuple->t_len;
 
 	if (shouldFree)
 		pfree(tuple);
@@ -2772,38 +2786,37 @@ hash_spill_tuple(HashAggSpill *spill, int input_bits, TupleTableSlot *slot,
  * 		read the next tuple from a batch file.  Return NULL if no more.
  */
 static MinimalTuple
-hash_read_spilled(BufFile *file, uint32 *hashp)
+hash_read_spilled(LogicalTapeSet *lts, int tapenum, uint32 *hashp)
 {
 	MinimalTuple	tuple;
 	uint32			t_len;
 	size_t			nread;
 	uint32			hash;
 
-	nread = BufFileRead(file, &hash, sizeof(uint32));
+	nread = LogicalTapeRead(lts, tapenum, &hash, sizeof(uint32));
 	if (nread == 0)
 		return NULL;
 	if (nread != sizeof(uint32))
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not read from HashAgg temporary file: %m")));
+				 errmsg("could not read the hash from HashAgg spilled tape: %m")));
 	if (hashp != NULL)
 		*hashp = hash;
 
-	nread = BufFileRead(file, &t_len, sizeof(t_len));
+	nread = LogicalTapeRead(lts, tapenum, &t_len, sizeof(t_len));
 	if (nread != sizeof(uint32))
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not read from HashAgg temporary file: %m")));
+				 errmsg("could not read the t_len from HashAgg spilled tape: %m")));
 
 	tuple = (MinimalTuple) palloc(t_len);
 	tuple->t_len = t_len;
 
-	nread = BufFileRead(file, (void *)((char *)tuple + sizeof(uint32)),
-						t_len - sizeof(uint32));
+	nread = LogicalTapeRead(lts, tapenum, (void *)((char *)tuple + sizeof(uint32)), t_len - sizeof(uint32));
 	if (nread != t_len - sizeof(uint32))
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not read from HashAgg temporary file: %m")));
+				 errmsg("could not read the data from HashAgg spilled tape: %m")));
 
 	return tuple;
 }
@@ -2815,15 +2828,16 @@ hash_read_spilled(BufFile *file, uint32 *hashp)
  * be done. Should be called in the aggregate's memory context.
  */
 static HashAggBatch *
-hash_batch_new(BufFile *input_file, int setno, int64 input_tuples,
+hash_batch_new(LogicalTapeSet *lts, int tapenum, int setno, int64 input_tuples,
 			   int input_bits)
 {
 	HashAggBatch *batch = palloc0(sizeof(HashAggBatch));
 
-	batch->input_file = input_file;
+	batch->input_tape = tapenum;
 	batch->input_bits = input_bits;
 	batch->input_tuples = input_tuples;
 	batch->setno = setno;
+	batch->lts = lts;
 
 	/* batch->spill will be set only after spilling this batch */
 
@@ -2860,7 +2874,7 @@ hash_finish_initial_spills(AggState *aggstate)
 /*
  * hash_spill_finish
  *
- * Transform spill files into new batches.
+ * Transform spill files into new batches. // XXX so the partitions are empty and ready to be reused
  */
 static void
 hash_spill_finish(AggState *aggstate, HashAggSpill *spill, int setno, int input_bits)
@@ -2872,30 +2886,23 @@ hash_spill_finish(AggState *aggstate, HashAggSpill *spill, int setno, int input_
 
 	for (i = 0; i < spill->n_partitions; i++)
 	{
-		BufFile         *file = spill->partitions[i];
 		MemoryContext    oldContext;
 		HashAggBatch    *new_batch;
 
-		/* partition is empty */
-		if (file == NULL)
-			continue;
-
-		/* rewind file for reading */
-		if (BufFileSeek(file, 0, 0L, SEEK_SET))
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not rewind HashAgg temporary file: %m")));
-
 		oldContext = MemoryContextSwitchTo(aggstate->ss.ps.state->es_query_cxt);
-		new_batch = hash_batch_new(file, setno, spill->ntuples[i],
-								   spill->partition_bits + input_bits);
+		LogicalTapeRewindForRead(spill->lts, spill->partitions[i], 0);
+		new_batch = hash_batch_new(spill->lts, spill->partitions[i], setno, spill->ntuples[i],
+					   spill->partition_bits + input_bits);
 		aggstate->hash_batches = lappend(aggstate->hash_batches, new_batch);
 		aggstate->hash_batches_used++;
 		MemoryContextSwitchTo(oldContext);
 	}
 
+	if (!list_member_ptr(aggstate->lts_list, spill->lts))
+		aggstate->lts_list = lappend(aggstate->lts_list, spill->lts);
 	pfree(spill->ntuples);
 	pfree(spill->partitions);
+	spill->partitions = NULL; // XXX mark it could be reused
 }
 
 /*
@@ -2904,13 +2911,10 @@ hash_spill_finish(AggState *aggstate, HashAggSpill *spill, int setno, int input_
 static void
 hash_reset_spill(HashAggSpill *spill)
 {
-	int i;
-	for (i = 0; i < spill->n_partitions; i++)
+	if (spill->lts != NULL)
 	{
-		BufFile         *file = spill->partitions[i];
-
-		if (file != NULL)
-			BufFileClose(file);
+		LogicalTapeSetClose(spill->lts);
+		spill->lts = NULL;
 	}
 	if (spill->ntuples != NULL)
 		pfree(spill->ntuples);
@@ -2940,16 +2944,19 @@ hash_reset_spills(AggState *aggstate)
 	foreach(lc, aggstate->hash_batches)
 	{
 		HashAggBatch *batch = (HashAggBatch*) lfirst(lc);
-		if (batch->input_file != NULL)
-		{
-			BufFileClose(batch->input_file);
-			batch->input_file = NULL;
-		}
 		hash_reset_spill(&batch->spill);
 		pfree(batch);
 	}
 	list_free(aggstate->hash_batches);
 	aggstate->hash_batches = NIL;
+
+	foreach(lc, aggstate->lts_list)
+	{
+		LogicalTapeSet *lts = (LogicalTapeSet *) lfirst(lc);
+		LogicalTapeSetClose(lts);
+	}
+	list_free(aggstate->lts_list);
+	aggstate->lts_list = NIL;
 }
 
 

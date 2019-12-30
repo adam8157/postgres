@@ -56,6 +56,7 @@ typedef struct TapeShare
 
 extern LogicalTapeSet *LogicalTapeSetCreate(int ntapes, TapeShare *shared,
 											SharedFileSet *fileset, int worker);
+extern LogicalTapeSet * LogicalTapeSetExtend(LogicalTapeSet *lts, int ntoextend);
 extern void LogicalTapeSetClose(LogicalTapeSet *lts);
 extern void LogicalTapeSetForgetFreeSpace(LogicalTapeSet *lts);
 extern size_t LogicalTapeRead(LogicalTapeSet *lts, int tapenum,

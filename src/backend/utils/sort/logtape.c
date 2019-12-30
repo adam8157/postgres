@@ -577,6 +577,47 @@ LogicalTapeSetCreate(int ntapes, TapeShare *shared, SharedFileSet *fileset,
 	return lts;
 }
 
+LogicalTapeSet *
+LogicalTapeSetExtend(LogicalTapeSet *lts, int ntoextend)
+{
+	LogicalTape    *lt;
+	int            i;
+
+	/*
+	 * Create top-level struct including per-tape LogicalTape structs.
+	 */
+	Assert(ntoextend > 0);
+	lts = (LogicalTapeSet *) repalloc(lts,offsetof(LogicalTapeSet, tapes) +
+					  lts->nTapes + ntoextend * sizeof(LogicalTape));
+	lts->freeBlocks       = (long *) repalloc(lts->freeBlocks, lts->freeBlocksLen * sizeof(long));
+	lts->nTapes           = lts->nTapes + ntoextend;
+
+	/*
+	 * Initialize per-tape structs.  Note we allocate the I/O buffer and the
+	 * first block for a tape only when it is first actually written to.  This
+	 * avoids wasting memory space when we overestimate the number of tapes needed.
+	 */
+	for (i = lts->nTapes - ntoextend; i < lts->nTapes; i++)
+	{
+		lt = &lts->tapes[i];
+		lt->writing           = true;
+		lt->frozen            = false;
+		lt->dirty             = false;
+		lt->firstBlockNumber  = -1L;
+		lt->curBlockNumber    = -1L;
+		lt->nextBlockNumber   = -1L;
+		lt->offsetBlockNumber = 0L;
+		lt->buffer            = NULL;
+		lt->buffer_size       = 0;
+		/* palloc() larger than MaxAllocSize would fail */
+		lt->max_size          = MaxAllocSize;
+		lt->pos               = 0;
+		lt->nbytes            = 0;
+	}
+
+	return lts;
+}
+
 /*
  * Close a logical tape set and release all resources.
  */
