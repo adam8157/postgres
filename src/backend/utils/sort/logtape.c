@@ -202,7 +202,7 @@ struct LogicalTapeSet
 
 	/* The array of logical tapes. */
 	int			nTapes;			/* # of logical tapes in set */
-	LogicalTape tapes[FLEXIBLE_ARRAY_MEMBER];	/* has nTapes nentries */
+	LogicalTape *tapes;	/* has nTapes nentries */
 };
 
 static void ltsWriteBlock(LogicalTapeSet *lts, long blocknum, void *buffer);
@@ -518,8 +518,8 @@ LogicalTapeSetCreate(int ntapes, TapeShare *shared, SharedFileSet *fileset,
 	 * Create top-level struct including per-tape LogicalTape structs.
 	 */
 	Assert(ntapes > 0);
-	lts = (LogicalTapeSet *) palloc(offsetof(LogicalTapeSet, tapes) +
-									ntapes * sizeof(LogicalTape));
+	lts = (LogicalTapeSet *) palloc0(sizeof(LogicalTapeSet));
+	lts->tapes = (LogicalTape *)palloc0(ntapes * sizeof(LogicalTape));
 	lts->nBlocksAllocated = 0L;
 	lts->nBlocksWritten = 0L;
 	lts->nHoleBlocks = 0L;
@@ -587,9 +587,7 @@ LogicalTapeSetExtend(LogicalTapeSet *lts, int ntoextend)
 	 * Create top-level struct including per-tape LogicalTape structs.
 	 */
 	Assert(ntoextend > 0);
-	lts = (LogicalTapeSet *) repalloc(lts,offsetof(LogicalTapeSet, tapes) +
-					  lts->nTapes + ntoextend * sizeof(LogicalTape));
-	lts->freeBlocks       = (long *) repalloc(lts->freeBlocks, lts->freeBlocksLen * sizeof(long));
+	lts->tapes = (LogicalTape *) repalloc(lts->tapes, (lts->nTapes + ntoextend) * sizeof(LogicalTape));
 	lts->nTapes           = lts->nTapes + ntoextend;
 
 	/*
@@ -1123,4 +1121,10 @@ long
 LogicalTapeSetBlocks(LogicalTapeSet *lts)
 {
 	return lts->nBlocksAllocated - lts->nHoleBlocks;
+}
+
+int
+LogicalTapeGetNTapes(LogicalTapeSet *lts)
+{
+	return lts->nTapes;
 }

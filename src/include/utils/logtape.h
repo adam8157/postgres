@@ -75,5 +75,6 @@ extern void LogicalTapeSeek(LogicalTapeSet *lts, int tapenum,
 extern void LogicalTapeTell(LogicalTapeSet *lts, int tapenum,
 							long *blocknum, int *offset);
 extern long LogicalTapeSetBlocks(LogicalTapeSet *lts);
+extern int LogicalTapeGetNTapes(LogicalTapeSet *lts);
 
 #endif							/* LOGTAPE_H */

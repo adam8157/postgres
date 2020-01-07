@@ -2709,7 +2709,7 @@ hash_spill_init(HashAggSpill *spill, int input_bits, uint64 input_groups,
 		spill->partition_bits = partition_bits;
 		spill->n_partitions   = npartitions;
 		spill->partitions     = palloc0(sizeof(int) * npartitions);
-			for (i = 0; i < spill->n_partitions; ++i)
+		for (i = 0; i < spill->n_partitions; ++i)
 		{
 			spill->partitions[i] = i;
 		}
@@ -2721,18 +2721,18 @@ hash_spill_init(HashAggSpill *spill, int input_bits, uint64 input_groups,
 	}
 	else // respill
 	{
-		old_npartitions = spill->n_partitions;
-		spill->partition_bits = my_log2(spill->n_partitions + npartitions);
-		spill->n_partitions   = 1L << spill->partition_bits;
+		old_npartitions = LogicalTapeGetNTapes(spill->lts);
+		spill->partition_bits = my_log2(npartitions);
+		spill->n_partitions   = (1L << spill->partition_bits);
 		spill->partitions     = palloc0(sizeof(int) * npartitions);
-		for (i = old_npartitions; i < spill->n_partitions; ++i)
+		int j = old_npartitions;
+		for (i = 0; i < spill->n_partitions; ++i)
 		{
-			spill->partitions[i] = i;
+			spill->partitions[i] = j;
+			j++;
 		}
 		spill->ntuples        = palloc0(sizeof(int64) * spill->n_partitions);
-		spill->lts            = LogicalTapeSetExtend(spill->lts,
-		                                             spill->n_partitions -
-			                                             old_npartitions);
+		spill->lts            = LogicalTapeSetExtend(spill->lts, spill->n_partitions);
 	}
 }
 
@@ -2838,6 +2838,7 @@ hash_batch_new(LogicalTapeSet *lts, int tapenum, int setno, int64 input_tuples,
 	batch->input_tuples = input_tuples;
 	batch->setno = setno;
 	batch->lts = lts;
+	batch->spill.lts = lts; // share same logical tape set
 
 	/* batch->spill will be set only after spilling this batch */
 
@@ -2902,7 +2903,6 @@ hash_spill_finish(AggState *aggstate, HashAggSpill *spill, int setno, int input_
 		aggstate->lts_list = lappend(aggstate->lts_list, spill->lts);
 	pfree(spill->ntuples);
 	pfree(spill->partitions);
-	spill->partitions = NULL; // XXX mark it could be reused
 }
 
 /*
