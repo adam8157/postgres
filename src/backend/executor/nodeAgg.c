@@ -2492,8 +2492,8 @@ agg_refill_hash_table(AggState *aggstate)
 								batch->input_tuples, aggstate->hashentrysize);
 			}
 
-			aggstate->hash_disk_used += hash_spill_tuple(
-				&batch->spill, batch->input_bits, slot, hash);
+			//aggstate->hash_disk_used +=
+			hash_spill_tuple(&batch->spill, batch->input_bits, slot, hash);
 		}
 
 		/* Advance the aggregates (or combine functions) */
