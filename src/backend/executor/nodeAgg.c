@@ -291,7 +291,7 @@ typedef struct HashAggSpill
 								   log2(n_partitions) parent partition bits */
 	int      *partitions;		/* output logtape numbers */
 	int64    *ntuples;			/* number of tuples in each partition */
-	LogicalTapeSet *lts;
+	LogicalTapeSet *lts;            /* the logical tape set it spills in */
 } HashAggSpill;
 
 /*
@@ -305,7 +305,7 @@ typedef struct HashAggBatch
 	int64    input_tuples;		/* number of tuples in this batch */
 	int		 setno;				/* grouping set */
 	HashAggSpill spill;			/* spill output */
-	LogicalTapeSet *lts;
+	LogicalTapeSet *lts;            /* the logical tape set it spills in */
 } HashAggBatch;
 
 static void select_current_set(AggState *aggstate, int setno, bool is_hash);
@@ -2492,7 +2492,11 @@ agg_refill_hash_table(AggState *aggstate)
 								batch->input_tuples, aggstate->hashentrysize);
 			}
 
-			//aggstate->hash_disk_used +=
+			/*
+			 * we use the same logical tape set, which allocates no
+			 * extra space while re-spilling
+			 */
+			/* aggstate->hash_disk_used += */
 			hash_spill_tuple(&batch->spill, batch->input_bits, slot, hash);
 		}
 
@@ -2715,12 +2719,9 @@ hash_spill_init(HashAggSpill *spill, int input_bits, uint64 input_groups,
 			spill->partitions[i] = i;
 		}
 		spill->ntuples        = palloc0(sizeof(int64) * spill->n_partitions);
-		spill->lts            = LogicalTapeSetCreate(npartitions,
-		                                             NULL,
-		                                             NULL,
-		                                             0); // TODO: worker is 0?
+		spill->lts            = LogicalTapeSetCreate(npartitions, NULL, NULL, 0); // TODO: worker is 0?
 	}
-	else // respill
+	else /* re-spilling */
 	{
 		old_npartitions = LogicalTapeGetNTapes(spill->lts);
 		spill->partition_bits = my_log2(npartitions);
@@ -2839,7 +2840,7 @@ hash_batch_new(LogicalTapeSet *lts, int tapenum, int setno, int64 input_tuples,
 	batch->input_tuples = input_tuples;
 	batch->setno = setno;
 	batch->lts = lts;
-	batch->spill.lts = lts; // share same logical tape set
+	batch->spill.lts = lts; /* share the same logical tape set if this batch re-spills */
 
 	/* batch->spill will be set only after spilling this batch */
 
@@ -2876,7 +2877,7 @@ hash_finish_initial_spills(AggState *aggstate)
 /*
  * hash_spill_finish
  *
- * Transform spill files into new batches. // XXX so the partitions are empty and ready to be reused
+ * Transform spill files into new batches.
  */
 static void
 hash_spill_finish(AggState *aggstate, HashAggSpill *spill, int setno, int input_bits)
@@ -2900,8 +2901,10 @@ hash_spill_finish(AggState *aggstate, HashAggSpill *spill, int setno, int input_
 		MemoryContextSwitchTo(oldContext);
 	}
 
+	/* remember all the logical tape sets for closing */
 	if (!list_member_ptr(aggstate->lts_list, spill->lts))
 		aggstate->lts_list = lappend(aggstate->lts_list, spill->lts);
+
 	pfree(spill->ntuples);
 	pfree(spill->partitions);
 }
