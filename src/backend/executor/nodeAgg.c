@@ -2691,6 +2691,7 @@ hash_spill_init(HashAggSpill *spill, int input_bits, uint64 input_groups,
 	int     npartitions;
 	int     partition_bits;
 	int     i;
+	int     j;
 	int     old_npartitions;
 
 	npartitions = hash_choose_num_spill_partitions(input_groups,
@@ -2725,7 +2726,7 @@ hash_spill_init(HashAggSpill *spill, int input_bits, uint64 input_groups,
 		spill->partition_bits = my_log2(npartitions);
 		spill->n_partitions   = (1L << spill->partition_bits);
 		spill->partitions     = palloc0(sizeof(int) * npartitions);
-		int j = old_npartitions;
+		j = old_npartitions;
 		for (i = 0; i < spill->n_partitions; ++i)
 		{
 			spill->partitions[i] = j;
